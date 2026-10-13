@@ -1,0 +1,1326 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show ThemeMode;
+import 'package:path_provider/path_provider.dart';
+
+import 'data.dart';
+import 'course_catalog.dart' show catalogCourseKey;
+import 'csv_import.dart';
+import 'export.dart';
+import 'models.dart';
+import 'scan_service.dart' show scorecardPhotoDirectory;
+import 'whs.dart';
+
+/// Stamped into every backup, so a file found on an old phone or a new one can
+/// be identified. Kept as a literal rather than read from the platform so
+/// tests and the desktop build get the same value as the app.
+const appVersion = '1.5.0+20';
+
+enum RoundImportMode { merge, overwrite }
+
+/// What a restore would change, counted the same way the restore counts it.
+typedef BackupPreview = ({
+  int roundsAdded,
+  int roundsSkipped,
+  int coursesAdded,
+  int colorsChanged,
+  int photosRestored,
+  bool themeChanged,
+});
+
+/// Local-first store. Persists to `ghin-golf.json` in the platform
+/// app-support directory (durable on Android, unlike the old temp-dir
+/// fallback). A pre-existing legacy save is copied there on first run.
+class GolfStore extends ChangeNotifier {
+  final String? _filePath;
+
+  GolfStore({String? filePath}) : _filePath = filePath;
+
+  Object? lastSaveError;
+
+  bool get hasSaveError => lastSaveError != null;
+
+  void clearSaveError() {
+    if (lastSaveError == null) return;
+    lastSaveError = null;
+    notifyListeners();
+  }
+
+  void _reportSaveFailure(Object error) {
+    lastSaveError = error;
+    notifyListeners();
+  }
+
+  List<Course> courses = seedCourses();
+  List<Round> rounds = [];
+
+  /// Courses for selection controls, sorted by name without changing the
+  /// store's insertion order (which is preserved for persistence/imports).
+  List<Course> get alphabeticalCourses {
+    final sorted = List<Course>.of(courses);
+    sorted.sort((left, right) {
+      final byName = left.name.toLowerCase().compareTo(
+        right.name.toLowerCase(),
+      );
+      if (byName != 0) return byName;
+      final byState = left.state.toLowerCase().compareTo(
+        right.state.toLowerCase(),
+      );
+      if (byState != 0) return byState;
+      final byCity = left.city.toLowerCase().compareTo(
+        right.city.toLowerCase(),
+      );
+      return byCity != 0 ? byCity : left.id.compareTo(right.id);
+    });
+    return sorted;
+  }
+
+  /// Score-vs-par colors as ARGB ints, keyed by clamped diff
+  /// (-2 eagle-or-better … 3 triple-or-worse). User-editable, persisted.
+  Map<int, int> scoreColors = Map.of(defaultScoreColors);
+
+  /// Stamped into every backup so a file found on an old phone can be
+  /// identified. Kept as a plain field rather than read from the platform so
+  /// tests and the desktop build can set it.
+  String appVersion = '';
+
+  /// Light, dark, or follow the system. A preference rather than a device
+  /// setting because a golfer checking a scorecard on a bright green in the
+  /// sun wants light, and the same golfer at 9pm wants dark, from one app.
+  ///
+  /// Stored as a [ThemeMode] but persisted as its name, so the save file stays
+  /// readable and an unknown value from a newer build falls back rather than
+  /// failing to load.
+  ThemeMode _themeMode = ThemeMode.system;
+
+  /// Read-only on purpose: [setThemeMode] is the only way to change it, so
+  /// every write goes through the save and the repaint.
+  ThemeMode get themeMode => _themeMode;
+
+  /// The save-file spelling of [themeMode]. For [load] and tests.
+  String get themeModeName => _themeMode.name;
+
+  set themeModeName(String? v) {
+    _themeMode = ThemeMode.values.firstWhere(
+      (m) => m.name == v,
+      // Anything unrecognised — a file from a future build, a hand edit —
+      // resolves to following the system, which is what the app did before
+      // this preference existed.
+      orElse: () => ThemeMode.system,
+    );
+  }
+
+  /// The posted history as CSV, for export.
+  ///
+  /// Lives here rather than in the UI so it uses the same lookups as the
+  /// handicap math: a round whose tee no longer resolves gets a blank
+  /// differential instead of a number the rest of the app would not produce.
+  String exportRoundsCsv() => toCsv(
+    rounds,
+    courseById: courseById,
+    teeById: teeById,
+    differentialFor: (r, tee) => r.differential(tee),
+    adjustedGrossFor: (r, tee) => r.adjustedGrossFor(tee),
+    puttsFor: (r) => r.totalPutts,
+    penaltiesFor: (r) => r.totalPenalties,
+  );
+
+  /// A restorable backup of everything: every round, every course, the score
+  /// colors, and the course photos.
+  ///
+  /// Differs from the save file by carrying a version and a timestamp, and by
+  /// holding all courses rather than only the custom ones, so a backup stays a
+  /// true snapshot even if the app's own data changes underneath it.
+  String exportRoundsJson() => toJson(
+    rounds,
+    courses,
+    scoreColors: scoreColors,
+    photos: _collectPhotos(),
+    appVersion: appVersion,
+    themeMode: themeModeName,
+  );
+
+  /// The course and round photos, base64, keyed the way [photoKey] and
+  /// [roundPhotoKey] name them.
+  ///
+  /// Reads from the paths the courses and rounds actually hold, so a photo
+  /// moved or deleted on disk simply does not appear rather than breaking
+  /// the export. Skipped on web, where imagePath is a blob url and there is
+  /// no file to read.
+  Map<String, String> _collectPhotos() {
+    final out = <String, String>{};
+    if (kIsWeb) return out;
+    void collect(String path, String key) {
+      if (path.isEmpty) return;
+      try {
+        final f = File(path);
+        if (!f.existsSync()) return;
+        out[key] = base64Encode(f.readAsBytesSync());
+      } catch (_) {
+        // A photo that cannot be read costs an image, not the backup.
+      }
+    }
+
+    for (final c in courses) {
+      collect(c.imagePath, photoKey(c));
+    }
+    for (final r in rounds) {
+      collect(r.imagePath, roundPhotoKey(r));
+    }
+    return out;
+  }
+
+  /// Merges a parsed backup into the store and saves once.
+  ///
+  /// Merging rather than replacing is the whole point: the round being
+  /// restored onto is the very one at risk in the backup, so a restore that
+  /// could clear the current history would be a poor way to recover it. Ids
+  /// already present are skipped, which also makes a second import of the same
+  /// file a no-op instead of a set of duplicates.
+  ///
+  /// Course and round photos are written to disk and the restored courses
+  /// and rounds repointed at them, because bytes in the backup but not on
+  /// the disk would still come back showing a broken image.
+  ///
+  /// Returns what changed, so the caller can report it rather than implying
+  /// the whole file was new.
+  Future<({int added, int skipped, int coursesAdded, int photosRestored})>
+  importBackup(
+    Backup b, {
+    RoundImportMode roundsMode = RoundImportMode.merge,
+  }) async {
+    final known = roundsMode == RoundImportMode.overwrite
+        ? <String>{}
+        : {for (final r in rounds) r.id};
+    final restoredRounds = <Round>[];
+    final knownCourses = {for (final c in courses) c.id};
+    var added = 0, skipped = 0, coursesAdded = 0;
+    for (final r in b.rounds) {
+      if (known.contains(r.id)) {
+        skipped++;
+        continue;
+      }
+      restoredRounds.add(r);
+      known.add(r.id);
+      added++;
+    }
+    for (final c in b.courses) {
+      // A course id the app already has is left alone: the bundled seed
+      // courses share ids with whatever the user edited, and their edited
+      // pars are the ones the existing rounds were scored against.
+      if (knownCourses.contains(c.id)) continue;
+      courses.add(c);
+      knownCourses.add(c.id);
+      coursesAdded++;
+    }
+    // Rounds land before the photos: the restore repoints rounds at their
+    // bytes by id, so staged rounds it cannot see would keep dangling paths.
+    if (roundsMode == RoundImportMode.overwrite && b.rounds.isNotEmpty) {
+      rounds = restoredRounds;
+    } else {
+      rounds.addAll(restoredRounds);
+    }
+    final photosRestored = await _restorePhotos(b);
+    if (b.scoreColors != null && b.scoreColors!.isNotEmpty) {
+      scoreColors = {...scoreColors, ...b.scoreColors!};
+    }
+    // Applied after the data, and only when the file actually names a mode, so
+    // an older backup leaves the phone's current setting alone.
+    if (b.themeMode != null) themeModeName = b.themeMode;
+    save();
+    notifyListeners();
+    return (
+      added: added,
+      skipped: skipped,
+      coursesAdded: coursesAdded,
+      photosRestored: photosRestored,
+    );
+  }
+
+  /// A course whose name matches, ignoring case and stray whitespace.
+  ///
+  /// Matching on name is the only way a CSV can be tied to a course: the ids
+  /// in a spreadsheet either came from a different install, or from a
+  /// different app entirely.
+  Course? courseByName(String name) {
+    final key = _nameKey(name);
+    for (final c in courses) {
+      if (_nameKey(c.name) == key) return c;
+    }
+    return null;
+  }
+
+  Tee? teeByName(Course course, String name) {
+    final key = _nameKey(name);
+    for (final t in course.tees) {
+      if (_nameKey(t.name) == key) return t;
+    }
+    return null;
+  }
+
+  static String _nameKey(String v) =>
+      v.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  /// What [importCsv] would bring in.
+  ///
+  /// Resolves every row exactly the way the import does, without touching the
+  /// store, so the count the user confirms is the count they get.
+  CsvPreview previewCsv(
+    List<CsvRound> rows, {
+    RoundImportMode roundsMode = RoundImportMode.merge,
+  }) {
+    final existing = roundsMode == RoundImportMode.overwrite
+        ? <String>{}
+        : _existingRoundKeys();
+    final planned = <String>{};
+    // Counted per *course*, not per row. Two rounds off the same unrecognised
+    // course build one course, and a preview that said otherwise would be
+    // promising the user more than the import delivers.
+    final plannedCourses = <String>{};
+    var added = 0, skipped = 0, coursesAdded = 0;
+    for (final row in rows) {
+      final key = _csvKey(row);
+      if (existing.contains(key) || planned.contains(key)) {
+        skipped++;
+        continue;
+      }
+      planned.add(key);
+      added++;
+      final course = _courseForCsv(row);
+      if (course != null) continue;
+      final id = _csvCourseId(row);
+      if (plannedCourses.add(id)) coursesAdded++;
+    }
+    return (
+      roundsAdded: added,
+      roundsSkipped: skipped,
+      coursesAdded: coursesAdded,
+    );
+  }
+
+  /// Restores rounds from a parsed CSV.
+  ///
+  /// Matches wherever it can: a round naming a course the app already has is
+  /// posted against that course, so its real pars and stroke indexes apply and
+  /// the differential is the one the app would have computed at the time.
+  /// Only a course the app has never heard of gets reconstructed, and the
+  /// caller reports how many, because a reconstructed course is a stand-in.
+  CsvImportResult importCsv(
+    List<CsvRound> rows, {
+    RoundImportMode roundsMode = RoundImportMode.merge,
+  }) {
+    if (roundsMode == RoundImportMode.overwrite && rows.isEmpty) {
+      throw ArgumentError('Cannot replace saved rounds with an empty import.');
+    }
+    final existing = roundsMode == RoundImportMode.overwrite
+        ? <String>{}
+        : _existingRoundKeys();
+    final planned = <String>{};
+    final addedIds = <String>[];
+    final importedRounds = <Round>[];
+    var added = 0, skipped = 0, coursesAdded = 0;
+    for (final row in rows) {
+      final key = _csvKey(row);
+      if (existing.contains(key) || planned.contains(key)) {
+        skipped++;
+        continue;
+      }
+      planned.add(key);
+
+      var course = _courseForCsv(row);
+      var reconstructed = false;
+      if (course == null) {
+        course = _courseFromCsv(row);
+        courses.add(course);
+        coursesAdded++;
+        reconstructed = true;
+      }
+      final tee = reconstructed
+          ? course.tees.first
+          : teeByName(course, row.teeName) ?? _addCsvTee(course, row);
+      final round = row.toRound(courseId: course.id, teeId: tee.id);
+      importedRounds.add(round);
+      addedIds.add(round.id);
+      added++;
+    }
+    if (roundsMode == RoundImportMode.overwrite) {
+      rounds = importedRounds;
+    } else {
+      rounds.addAll(importedRounds);
+    }
+    if (added > 0 || roundsMode == RoundImportMode.overwrite) {
+      save();
+      notifyListeners();
+    }
+    return (
+      added: added,
+      skipped: skipped,
+      coursesAdded: coursesAdded,
+      roundIds: addedIds,
+    );
+  }
+
+  /// The course a row belongs to, or null if the app has never seen it.
+  ///
+  /// Name matching is enough on its own, and deliberately so: a course built
+  /// for row one carries row one's name, so row two of the same course finds
+  /// it here. A second lookup keyed on the generated id would be a branch
+  /// nothing can reach.
+  Course? _courseForCsv(CsvRound row) =>
+      row.courseName.isEmpty ? null : courseByName(row.courseName);
+
+  /// The id a row's course would be built under, derived from its name so the
+  /// same course always lands on the same id and a second import finds the
+  /// first one's work instead of building a duplicate.
+  String _csvCourseId(CsvRound row) =>
+      'csv-course-${_slug(row.courseName.isEmpty ? 'Unknown' : row.courseName)}';
+
+  /// A course built to hold a round the app has never seen.
+  ///
+  /// A CSV routinely names courses that are not in the app, and refusing the
+  /// file over it would make the import useless for its main case: moving a
+  /// history in from somewhere else.
+  ///
+  /// Per-hole par is **distributed** from the row's own par total, because a
+  /// spreadsheet carries a total and not a hole-by-hole layout. That is a
+  /// reconstruction, not a recovery, so the course is marked custom and the
+  /// caller says out loud how many were made this way.
+  Course _courseFromCsv(CsvRound row) {
+    final n = row.scores.length;
+    final playedPars = _parPerHole(row, n);
+    final holeCount = row.startHole + n > 9 ? 18 : n;
+    final pars = List<int>.filled(holeCount, 4);
+    for (var i = 0; i < n; i++) {
+      pars[row.startHole + i] = playedPars[i];
+    }
+    final id = _csvCourseId(row);
+    return Course(
+      id: id,
+      name: row.courseName.isEmpty ? 'Unknown course' : row.courseName,
+      city: '',
+      state: '',
+      custom: true,
+      tees: [
+        Tee(
+          id: '$id-tee',
+          name: row.teeName.isEmpty ? 'Imported' : row.teeName,
+          rating: row.rating ?? 0,
+          slope: row.slope ?? 0,
+          holes: [
+            for (var i = 0; i < holeCount; i++)
+              HoleInfo(
+                number: i + 1,
+                par: pars[i],
+                yardage: 0,
+                strokeIndex: null,
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Spreads the row's par total across the holes played, or falls back to all
+  /// par 4 when the file has no par column — the most common hole, and so the
+  /// least wrong flat guess available.
+  List<int> _parPerHole(CsvRound row, int n) {
+    if (n == 0) return const [];
+    final total = row.parTotal;
+    if (total == null || total <= 0) return List.filled(n, 4);
+    final base = total ~/ n;
+    final extra = total % n;
+    return [for (var i = 0; i < n; i++) base + (i < extra ? 1 : 0)];
+  }
+
+  /// Adds the row's tee to a course that exists but does not have it, so a
+  /// round played off the Gold tees is not scored against the White.
+  Tee _addCsvTee(Course course, CsvRound row) {
+    final n = row.scores.length;
+    final playedPars = _parPerHole(row, n);
+    final holeCount = row.startHole + n > 9 ? 18 : n;
+    final pars = List<int>.filled(holeCount, 4);
+    for (var i = 0; i < n; i++) {
+      pars[row.startHole + i] = playedPars[i];
+    }
+    final tee = Tee(
+      id: '${course.id}-csv-${_slug(row.teeName.isEmpty ? 'imported' : row.teeName)}',
+      name: row.teeName.isEmpty ? 'Imported' : row.teeName,
+      rating: row.rating ?? 0,
+      slope: row.slope ?? 0,
+      holes: [
+        for (var i = 0; i < holeCount; i++)
+          HoleInfo(number: i + 1, par: pars[i], yardage: 0),
+      ],
+    );
+    courses[courses.indexWhere((c) => c.id == course.id)] = course.withTee(tee);
+    return tee;
+  }
+
+  /// Identity of a round for spotting a re-import.
+  ///
+  /// Deliberately the *content* — course, tee, date, and the scores — and not
+  /// the file's id. A round that arrives twice under different ids is still
+  /// the same round, and posting it twice would corrupt the handicap average
+  /// in a way nothing in the UI would reveal.
+  String _csvKey(CsvRound row) => _csvKeyOf(
+    row.courseName,
+    row.teeName,
+    row.playedAt,
+    row.scores,
+    row.startHole,
+  );
+
+  static String _csvKeyOf(
+    String courseName,
+    String teeName,
+    DateTime playedAt,
+    List<int> scores,
+    int startHole,
+  ) =>
+      '${_nameKey(courseName)}|${_nameKey(teeName)}|'
+      '${playedAt.toIso8601String()}|$startHole|'
+      '${scores.join(',')}';
+
+  /// The same keys, built from the rounds already posted.
+  ///
+  /// Falls back to the raw id when a course or tee has since been deleted, so
+  /// the key stays unique rather than collapsing two rounds into one.
+  Set<String> _existingRoundKeys() {
+    final out = <String>{};
+    for (final r in rounds) {
+      final c = courseById(r.courseId);
+      final t = teeById(r.courseId, r.teeId);
+      out.add(
+        _csvKeyOf(c?.name ?? r.courseId, t?.name ?? r.teeId, r.playedAt, [
+          for (final h in r.holes) h.score,
+        ], r.startHole),
+      );
+    }
+    return out;
+  }
+
+  static String _slug(String v) => v
+      .trim()
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+      .replaceAll(RegExp(r'^-+|-+$'), '');
+
+  /// Writes the backup's inline photos to the same folder the scanner uses
+  /// and repoints the courses and rounds at them. Best effort: a photo that
+  /// will not write costs an image, not the restore.
+  Future<int> _restorePhotos(Backup b) async {
+    if (b.photos.isEmpty || kIsWeb) return 0;
+    var written = 0;
+    Directory? dir;
+    for (final entry in b.photos.entries) {
+      try {
+        // Only photos the app would actually gain. A key with no course or
+        // round is an orphan from something never restored, and an owner
+        // that already has its photo on disk has nothing to gain either.
+        final cIdx = courses.indexWhere((c) => photoKey(c) == entry.key);
+        final rIdx = cIdx >= 0
+            ? -1
+            : rounds.indexWhere((r) => roundPhotoKey(r) == entry.key);
+        if (cIdx < 0 && rIdx < 0) continue;
+        final existing = cIdx >= 0
+            ? courses[cIdx].imagePath
+            : rounds[rIdx].imagePath;
+        if (existing.isNotEmpty && _fileExists(existing)) continue;
+        dir ??= await scorecardPhotoDirectory();
+        final bytes = base64Decode(entry.value);
+        final dest = '${dir.path}/${entry.key}';
+        await File(dest).writeAsBytes(bytes, flush: true);
+        if (cIdx >= 0) {
+          courses[cIdx] = courses[cIdx].copyWithImagePath(dest);
+        } else {
+          rounds[rIdx] = rounds[rIdx].copyWithImagePath(dest);
+        }
+        written++;
+      } catch (_) {
+        // Keep going: one bad photo should not abandon the rest.
+      }
+    }
+    return written;
+  }
+
+  static bool _fileExists(String path) {
+    try {
+      return File(path).existsSync();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// What [importBackup] would change, using the same rules it uses.
+  ///
+  /// The restore screen asks "is there anything here?" before it commits, and
+  /// that question has to be asked of the whole backup. An earlier version
+  /// looked only at rounds, so a backup whose rounds were all already present
+  /// was reported as "nothing new" and the courses, colors and photos it
+  /// carried were silently dropped. Deriving the preview from the same rules as
+  /// the import keeps the number the user is shown from disagreeing with what
+  /// actually happens.
+  BackupPreview previewBackup(
+    Backup b, {
+    RoundImportMode roundsMode = RoundImportMode.merge,
+  }) {
+    final knownRounds = roundsMode == RoundImportMode.overwrite
+        ? <String>{}
+        : {for (final r in rounds) r.id};
+    final knownCourses = {for (final c in courses) c.id};
+    var roundsAdded = 0, roundsSkipped = 0;
+    for (final r in b.rounds) {
+      if (knownRounds.contains(r.id)) {
+        roundsSkipped++;
+      } else {
+        roundsAdded++;
+        knownRounds.add(r.id);
+      }
+    }
+    var coursesAdded = 0;
+    for (final c in b.courses) {
+      if (!knownCourses.contains(c.id)) coursesAdded++;
+    }
+    // The import adds the backup's courses before it restores photos, so a
+    // photo for a course this backup is about to add still counts. Matching
+    // against the courses already in the store would undercount exactly the
+    // case a fresh restore is for.
+    final effective = <Course>[
+      ...courses,
+      for (final c in b.courses)
+        if (!knownCourses.contains(c.id)) c,
+    ];
+    // Appearance restores from a backup too, so a backup that carries nothing
+    // but a different theme is still worth restoring. Counted the same way as
+    // the colors: a differing value is a change, not merely a present key.
+    final themeChanged = b.themeMode != null && b.themeMode != themeModeName;
+
+    // The import lets the backup's colors win, so a color is a change when the
+    // value differs, not merely when the key is absent.
+    var colorsChanged = 0;
+    final incoming = b.scoreColors;
+    if (incoming != null) {
+      for (final e in incoming.entries) {
+        if (scoreColors[e.key] != e.value) colorsChanged++;
+      }
+    }
+    var photosRestored = 0;
+    if (!kIsWeb) {
+      for (final key in b.photos.keys) {
+        final idx = effective.indexWhere((c) => photoKey(c) == key);
+        if (idx < 0) continue;
+        final existing = effective[idx].imagePath;
+        if (existing.isEmpty || !_fileExists(existing)) photosRestored++;
+      }
+    }
+    return (
+      roundsAdded: roundsAdded,
+      roundsSkipped: roundsSkipped,
+      coursesAdded: coursesAdded,
+      colorsChanged: colorsChanged,
+      photosRestored: photosRestored,
+      themeChanged: themeChanged,
+    );
+  }
+
+  /// Saved color for a score diff (clamped to -2..3), or the default.
+  int scoreColorValue(int diff) {
+    final d = diff.clamp(-2, 3);
+    return scoreColors[d] ?? defaultScoreColors[d]!;
+  }
+
+  /// Sets the app's brightness and persists it.
+  ///
+  /// A method rather than a bare field write so no caller has to remember the
+  /// save-then-notify order, and neither half can be forgotten: a theme that
+  /// looks right until the app restarts is worse than one that never changes.
+  void setThemeMode(ThemeMode mode) {
+    if (mode == _themeMode) return;
+    _themeMode = mode;
+    save();
+    notifyListeners();
+  }
+
+  void setScoreColor(int diff, int value) {
+    scoreColors[diff.clamp(-2, 3)] = value;
+    save();
+    notifyListeners();
+  }
+
+  void resetScoreColors() {
+    scoreColors = Map.of(defaultScoreColors);
+    save();
+    notifyListeners();
+  }
+
+  /// The player's Handicap Index, or null before three acceptable scores.
+  ///
+  /// Built from the whole scoring record rather than from a bag of
+  /// differentials, because the WHS cap depends on the record's length and
+  /// age. Rounds whose course or tee no longer resolves are dropped: their
+  /// handicap is unknown, and inventing one would quietly move the index.
+  double? get handicapIndex {
+    return _handicapIndexFor(rounds);
+  }
+
+  /// Index in effect before any score on [date] is posted.
+  ///
+  /// The handicap revision happens after the day is complete, so a second
+  /// round played on the same calendar date uses the same index as the first.
+  double? handicapIndexBefore(DateTime date) {
+    final day = DateTime(date.year, date.month, date.day);
+    return _handicapIndexFor(
+      rounds.where((round) {
+        final playedDay = DateTime(
+          round.playedAt.year,
+          round.playedAt.month,
+          round.playedAt.day,
+        );
+        return playedDay.isBefore(day);
+      }),
+    );
+  }
+
+  double? _handicapIndexFor(Iterable<Round> source) {
+    final roundsWithTees = <({Round round, Tee tee, int order})>[];
+    var order = 0;
+    for (final r in source) {
+      final tee = teeById(r.courseId, r.teeId);
+      if (tee != null) {
+        roundsWithTees.add((round: r, tee: tee, order: order));
+      }
+      order++;
+    }
+    if (roundsWithTees.isEmpty) return null;
+    roundsWithTees.sort((left, right) {
+      final dateOrder = left.round.playedAt.compareTo(right.round.playedAt);
+      return dateOrder != 0 ? dateOrder : left.order.compareTo(right.order);
+    });
+
+    // A nine-hole round posted before the golfer had an Index has no expected
+    // nine differential snapshot. Bootstrap those early rounds with a
+    // self-consistent estimate, then use the rolling Index once available.
+    var initialIndexEstimate = 0.0;
+    double? result;
+    for (var iteration = 0; iteration < 50; iteration++) {
+      final record = <ScoredRound>[];
+      var dayStart = 0;
+      while (dayStart < roundsWithTees.length) {
+        var dayEnd = dayStart + 1;
+        while (dayEnd < roundsWithTees.length &&
+            _sameCalendarDay(
+              roundsWithTees[dayStart].round.playedAt,
+              roundsWithTees[dayEnd].round.playedAt,
+            )) {
+          dayEnd++;
+        }
+        final indexBeforeDay = handicapIndexFromRecord(record);
+        final forDay = <ScoredRound>[];
+        for (var i = dayStart; i < dayEnd; i++) {
+          final entry = roundsWithTees[i];
+          final round = entry.round;
+          final tee = entry.tee;
+          final differential = round.differential(tee);
+          if (differential != null) {
+            forDay.add(
+              ScoredRound(
+                playedAt: round.playedAt,
+                differential: differential,
+                unroundedDifferential: round.unroundedDifferential(tee),
+                handicapIndexAtPlay: round.handicapIndexAtPlay,
+                holesPlayed: round.holes.length,
+              ),
+            );
+            continue;
+          }
+
+          if (round.holes.length != 9 || round.handicapIndexAtPlay != null) {
+            continue;
+          }
+          final playedDifferential = round.nineHolePlayedDifferential(tee);
+          if (playedDifferential == null) continue;
+          final indexForExpectedScore = indexBeforeDay ?? initialIndexEstimate;
+          final unrounded =
+              playedDifferential +
+              expectedNineHoleScoreDifferential(indexForExpectedScore);
+          final completedDifferential = (unrounded * 10).round() / 10.0;
+          forDay.add(
+            ScoredRound(
+              playedAt: round.playedAt,
+              differential: completedDifferential,
+              unroundedDifferential: unrounded,
+              holesPlayed: round.holes.length,
+            ),
+          );
+        }
+        record.addAll(forDay);
+        dayStart = dayEnd;
+      }
+
+      result = handicapIndexFromRecord(record);
+      if (result == null || (result - initialIndexEstimate).abs() < 0.01) {
+        return result;
+      }
+      initialIndexEstimate = result;
+    }
+    return result;
+  }
+
+  bool _sameCalendarDay(DateTime left, DateTime right) =>
+      left.year == right.year &&
+      left.month == right.month &&
+      left.day == right.day;
+
+  Course? courseById(String id) {
+    for (final c in courses) {
+      if (c.id == id) return c;
+    }
+    return null;
+  }
+
+  /// The single saved course matching a catalog entry by name, or null.
+  ///
+  /// Pre-removal imports were migrated to facility-less synthetic ids, so a
+  /// catalog entry no longer matches them by id. Matching by normalized
+  /// (state, name, city) lets a re-import offer Update instead of building
+  /// a duplicate — but only when exactly one course matches, so two
+  /// same-named courses never resolve to the wrong one.
+  Course? uniqueCourseByName(String state, String name, String city) {
+    String norm(String value) =>
+        value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+    final matches = [
+      for (final c in courses)
+        if (norm(c.state) == norm(state) &&
+            norm(c.name) == norm(name) &&
+            norm(c.city) == norm(city))
+          c,
+    ];
+    return matches.length == 1 ? matches.single : null;
+  }
+
+  Tee? teeById(String courseId, String teeId) {
+    final c = courseById(courseId);
+    if (c == null) return null;
+    for (final t in c.tees) {
+      if (t.id == teeId) return t;
+    }
+    return null;
+  }
+
+  /// Token search over name + city + state. Every token must match somewhere.
+  List<Course> searchCourses(String query) {
+    final tokens = query
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+    if (tokens.isEmpty) return List<Course>.from(courses);
+    return courses.where((c) {
+      final hay = '${c.name} ${c.city} ${c.state}'.toLowerCase();
+      return tokens.every((t) => hay.contains(t));
+    }).toList();
+  }
+
+  void addCourse(Course c) {
+    courses.add(c);
+    save();
+    notifyListeners();
+  }
+
+  /// Deletes a course. Rounds already posted on it are kept; their
+  /// course name renders as '?' and they are skipped by stat summaries.
+  void deleteCourse(String id) {
+    courses.removeWhere((c) => c.id == id);
+    save();
+    notifyListeners();
+  }
+
+  /// Replaces a saved custom course (same id). Posted rounds stay linked.
+  void updateCourse(Course c) {
+    final i = courses.indexWhere((e) => e.id == c.id);
+    if (i < 0) return;
+    courses[i] = c;
+    save();
+    notifyListeners();
+  }
+
+  void addRound(Round r) {
+    rounds.add(r);
+    save();
+    notifyListeners();
+  }
+
+  /// Replaces the round with the same id, keeping its position.
+  ///
+  /// Editing a posted round has to update the original rather than post a
+  /// second one: the round being corrected is the one in the history, and a
+  /// duplicate would double it in the handicap average.
+  void updateRound(Round r) {
+    final i = rounds.indexWhere((x) => x.id == r.id);
+    if (i < 0) {
+      addRound(r);
+      return;
+    }
+    rounds[i] = r;
+    save();
+    notifyListeners();
+  }
+
+  /// Removes a round and hands back what was removed and where it sat, so an
+  /// undo can put it back in the same spot rather than at the end of a list
+  /// whose order the stats and exports depend on.
+  ({Round round, int index})? deleteRound(String id) {
+    final i = rounds.indexWhere((r) => r.id == id);
+    if (i < 0) return null;
+    final removed = rounds.removeAt(i);
+    save();
+    notifyListeners();
+    return (round: removed, index: i);
+  }
+
+  /// Removes several rounds at once, in one write.
+  ///
+  /// Backs a CSV import's undo, and takes ids rather than a count: a round
+  /// posted after the import is not the one that should disappear, and nothing
+  /// in the store's ordering could tell the two apart after the fact.
+  ///
+  /// One pass on purpose. Undoing by deleting each round in turn rewrites the
+  /// save file once per round, and deleting from the end backwards is what
+  /// keeps the survivors in the order the stats and exports depend on — this
+  /// simply never reorders them.
+  int removeRounds(List<String> ids) {
+    final drop = ids.toSet();
+    if (drop.isEmpty) return 0;
+    final kept = rounds.where((r) => !drop.contains(r.id)).toList();
+    final removed = rounds.length - kept.length;
+    if (removed == 0) return 0;
+    rounds = kept;
+    save();
+    notifyListeners();
+    return removed;
+  }
+
+  /// Puts a deleted round back where it was.
+  void restoreRound(Round r, int index) {
+    final at = index.clamp(0, rounds.length);
+    rounds.insert(at, r);
+    save();
+    notifyListeners();
+  }
+
+  // ---- stats over 18-hole rounds ----
+  /// Round-level averages, over the rounds that can still be read.
+  ///
+  /// A round whose course or tee has been deleted is skipped entirely, so it
+  /// must also be left out of the per-round denominators — counting it there
+  /// would drag the average down with holes that were never measured.
+  ///
+  /// Holes are read from [Round.startHole] on, not from the front of the tee:
+  /// a back-nine round's scores belong to holes 10-18, and pairing them with
+  /// the front nine would grade every hole against the wrong par.
+  Map<String, double> statSummary() {
+    var fwHit = 0, fwTotal = 0, girHit = 0, holes = 0, putts = 0, pens = 0;
+    var driveTotal = 0, driveCount = 0, scoredRounds = 0;
+    for (final r in rounds) {
+      final tee = teeById(r.courseId, r.teeId);
+      if (tee == null) continue;
+      // A tee edited down after the round no longer covers the holes played.
+      if (r.startHole + r.holes.length > tee.holes.length) continue;
+      scoredRounds++;
+      for (var i = 0; i < r.holes.length; i++) {
+        final h = r.holes[i];
+        final t = tee.holes[r.startHole + i];
+        holes++;
+        putts += h.putts;
+        pens += h.penalties;
+        if (t.par > 3) {
+          if (h.fairway != 'NA') {
+            fwTotal++;
+            if (h.fairway == 'H') fwHit++;
+          }
+        }
+        if (h.gir) girHit++;
+        if (h.driveDistance > 0) {
+          driveTotal += h.driveDistance;
+          driveCount++;
+        }
+      }
+    }
+    if (holes == 0) return {};
+    return {
+      'FIR': fwTotal == 0 ? 0 : fwHit * 100.0 / fwTotal,
+      'GIR': girHit * 100.0 / holes,
+      'Putts/Hole': putts * 1.0 / holes,
+      'Pen/Round': scoredRounds == 0 ? 0 : pens * 1.0 / scoredRounds,
+      'AvgDrive': driveCount == 0 ? 0 : driveTotal * 1.0 / driveCount,
+    };
+  }
+
+  // ---- persistence ----
+  /// Test-only override for the backing file, so tests never touch the
+  /// user's real data.
+  @visibleForTesting
+  static String? testFilePath;
+
+  /// Tail of the write chain, so saves queue instead of overlapping.
+  Future<void> _pending = Future<void>.value();
+
+  /// Home-directory override for the legacy save location, so migration
+  /// tests can point at a temp dir instead of the real `$HOME`.
+  @visibleForTesting
+  static String? testLegacyHome;
+
+  /// Opt-in for the rare test that exercises the real default save path.
+  /// Otherwise, under `flutter test` the default save is a temp-dir
+  /// throwaway: mutations auto-save, often unawaited, and a bare [GolfStore]
+  /// in a test must never clobber (or read) the developer's real save file.
+  @visibleForTesting
+  static bool testAllowDefaultPath = false;
+
+  /// Save file. Instance and test overrides resolve synchronously so tests
+  /// never touch plugins; otherwise the platform app-support directory,
+  /// falling back to the legacy locations when the plugin is unavailable.
+  Future<File> _file() async {
+    final instancePath = _filePath;
+    if (instancePath != null) return File(instancePath);
+    final t = testFilePath;
+    if (t != null) return File(t);
+    if (!testAllowDefaultPath &&
+        Platform.environment['FLUTTER_TEST'] == 'true') {
+      return File('${Directory.systemTemp.path}/ghin-golf-test.json');
+    }
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final f = File('${dir.path}/ghin-golf.json');
+      await _migrateLegacySave(f);
+      return f;
+    } catch (_) {
+      // Plugin unavailable (web, early boot): keep the old behavior rather
+      // than losing the ability to save at all.
+      return _legacyFile();
+    }
+  }
+
+  /// Where saves lived before the app-support move: `$HOME/.ghin-golf.json`
+  /// on desktop, the temp dir when no home was set (notably Android, where a
+  /// temp-dir save could be purged by the OS).
+  File _legacyFile() {
+    final home =
+        testLegacyHome ??
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'];
+    if (home != null && home.isNotEmpty) {
+      return File('$home/.ghin-golf.json');
+    }
+    return File('${Directory.systemTemp.path}/ghin-golf.json');
+  }
+
+  /// First-run copy from a legacy save into the app-support directory.
+  /// Copies, never moves, so reinstalling an older build cannot strand
+  /// history; a present target always wins and is never overwritten.
+  /// Never throws.
+  Future<void> _migrateLegacySave(File target) async {
+    try {
+      if (await target.exists()) return;
+      final home =
+          testLegacyHome ??
+          Platform.environment['HOME'] ??
+          Platform.environment['USERPROFILE'];
+      final candidates = [
+        if (home != null && home.isNotEmpty) File('$home/.ghin-golf.json'),
+        File('${Directory.systemTemp.path}/ghin-golf.json'),
+      ];
+      for (final src in candidates) {
+        if (src.path == target.path) continue;
+        if (await src.exists()) {
+          await src.copy(target.path);
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Pre-removal save compatibility, applied on every load.
+  ///
+  /// Courses imported from the old catalog carry `ncrdb-<state>-<legacyid>`
+  /// ids (with the id embedded in their tee ids, and rounds pointing at
+  /// both). This rewrites them to the synthetic `cat-<state>-<key>` scheme
+  /// — the key recomputed from the stored names, with an empty facility
+  /// the old records never kept — and rewrites rounds to follow. Courses,
+  /// tees, and rounds without the old prefix are untouched, as are rounds
+  /// whose course is gone (they already render as unknown). Never throws:
+  /// on any surprise the save loads unmigrated, exactly as before.
+  static Map<String, dynamic> _migratedSave(Map<String, dynamic> raw) {
+    try {
+      return migrateNcrdbSave(raw);
+    } catch (_) {
+      return raw;
+    }
+  }
+
+  Future<void> load() async {
+    try {
+      final f = await _file();
+      if (!await f.exists()) return;
+      final raw = json.decode(await f.readAsString()) as Map<String, dynamic>;
+      final j = _migratedSave(raw);
+      rounds = ((j['rounds'] as List?) ?? [])
+          .map((e) => Round.fromJson(Map<String, dynamic>.from(e as Map)))
+          .toList();
+      final savedCourses = ((j['customCourses'] as List?) ?? [])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      final seeds = seedCourses();
+      final seedIds = seeds.map((c) => c.id).toSet();
+      final seedOverrides = {
+        for (final e in savedCourses)
+          if (seedIds.contains(e['id']))
+            e['id'] as String: Course.fromJson(e, custom: false),
+      };
+      courses = [
+        for (final seed in seeds)
+          _mergeMissingSeedNineRatings(seedOverrides[seed.id] ?? seed, seed),
+        for (final e in savedCourses)
+          if (!seedIds.contains(e['id'])) Course.fromJson(e),
+      ];
+      scoreColors = decodeScoreColors(j['scoreColors']);
+      themeModeName = j['themeMode'] as String?;
+      notifyListeners();
+    } catch (_) {
+      // Unreadable file: keep the evidence before anything overwrites it, so
+      // a bad write can be recovered by hand instead of silently starting the
+      // user off with an empty history.
+      await _quarantineUnreadable();
+    }
+  }
+
+  /// Moves an unparseable save file aside, timestamped so the copy says when
+  /// the bad write happened. Never throws.
+  Future<void> _quarantineUnreadable() async {
+    try {
+      final f = await _file();
+      if (!f.existsSync()) return;
+      final now = DateTime.now();
+      final stamp =
+          '${now.year}${_pad2(now.month)}${_pad2(now.day)}'
+          '-${_pad2(now.hour)}${_pad2(now.minute)}${_pad2(now.second)}';
+      f.copySync('${f.path}.corrupt-$stamp');
+    } catch (_) {}
+  }
+
+  static String _pad2(int n) => n.toString().padLeft(2, '0');
+
+  Course _mergeMissingSeedNineRatings(Course saved, Course seed) {
+    final seedTees = {for (final tee in seed.tees) tee.id: tee};
+    return Course(
+      id: saved.id,
+      name: saved.name,
+      city: saved.city,
+      state: saved.state,
+      custom: saved.custom,
+      imagePath: saved.imagePath,
+      ocrText: saved.ocrText,
+      ocrAttempts: saved.ocrAttempts,
+      tees: [
+        for (final tee in saved.tees)
+          if (seedTees[tee.id] case final seedTee?)
+            Tee(
+              id: tee.id,
+              name: tee.name,
+              rating: tee.rating,
+              slope: tee.slope,
+              frontNineRating: tee.frontNineRating ?? seedTee.frontNineRating,
+              frontNineSlope: tee.frontNineSlope ?? seedTee.frontNineSlope,
+              backNineRating: tee.backNineRating ?? seedTee.backNineRating,
+              backNineSlope: tee.backNineSlope ?? seedTee.backNineSlope,
+              holes: tee.holes,
+            )
+          else
+            tee,
+      ],
+    );
+  }
+
+  /// Saves the whole store.
+  ///
+  /// Called on every mutation, and none of them wait for the last, so
+  /// several writes are normally in flight at once. They are chained: each
+  /// one starts after the previous has finished, so the file is only ever
+  /// written by one writer and the last queued state is the one that lands.
+  ///
+  /// The chain never breaks, so a write that fails does not wedge the rest.
+  Future<void> save() {
+    _pending = _pending.then((_) => _writeToDisk()).catchError((
+      Object error,
+      StackTrace _,
+    ) {
+      _reportSaveFailure(error);
+    });
+    return _pending;
+  }
+
+  Future<void> _writeToDisk() async {
+    try {
+      final f = await _file();
+      final seededIds = seedCourses().map((c) => c.id).toSet();
+      final payload = json.encode({
+        'rounds': rounds.map((r) => r.toJson()).toList(),
+        'customCourses': courses
+            .where((c) => c.custom || seededIds.contains(c.id))
+            .map((c) => c.toJson())
+            .toList(),
+        'scoreColors': encodeScoreColors(scoreColors),
+        // A display preference, not history: deliberately not in the JSON
+        // backup, which is about getting your rounds back, not about how this
+        // particular phone was set up.
+        'themeMode': themeMode.name,
+      });
+      // Write beside the target, then rename over it. A rename within a
+      // directory is atomic, so the save file holds either the old contents
+      // or the new ones and is never a truncated mixture — which is the
+      // difference between losing the round being posted and losing every
+      // round ever posted, since [load] cannot read a half-written file.
+      final tmp = File('${f.path}.tmp');
+      await tmp.writeAsString(payload, flush: true);
+      await tmp.rename(f.path);
+      lastSaveError = null;
+      notifyListeners();
+    } catch (error) {
+      _reportSaveFailure(error);
+    }
+  }
+}
+
+// Alias to avoid name clash between the getter and the whs function.
+double? handicapIndexFunc(List<ScoredRound> record) =>
+    handicapIndexFromRecord(record);
+
+/// Id prefix the pre-removal catalog gave imported courses.
+const ncrdbIdPrefix = 'ncrdb-';
+
+String _swapIdPrefix(String id, String oldPrefix, String newPrefix) =>
+    id.startsWith(oldPrefix)
+        ? '$newPrefix${id.substring(oldPrefix.length)}'
+        : id;
+
+/// Rewrites pre-removal `ncrdb-<state>-<legacyid>` ids in a decoded save file
+/// to the synthetic catalog scheme. Returns a copy; the input is untouched.
+///
+/// For each stored course with the old prefix, the new id is
+/// `cat-<state>-<key>` with the key recomputed from the stored names (old
+/// records kept no facility, so facility is empty — exactly why re-imports
+/// match by name instead of id). The course's tee ids are prefix-swapped,
+/// and every round pointing at the old course/tee ids follows. Anything
+/// else passes through byte-identical.
+Map<String, dynamic> _deepMap(Map source) => {
+  for (final entry in source.entries)
+    '${entry.key}': entry.value is Map
+        ? _deepMap(entry.value as Map)
+        : entry.value is List
+        ? [
+            for (final v in entry.value as List)
+              v is Map ? _deepMap(v) : v,
+          ]
+        : entry.value,
+};
+
+Map<String, dynamic> migrateNcrdbSave(Map<String, dynamic> json) {
+  final courseMaps = ((json['customCourses'] as List?) ?? [])
+      .whereType<Map>()
+      .map(_deepMap)
+      .toList();
+  final roundMaps = ((json['rounds'] as List?) ?? [])
+      .whereType<Map>()
+      .map(_deepMap)
+      .toList();
+  if (!courseMaps.any(
+    (c) => (c['id'] is String && (c['id'] as String).startsWith(ncrdbIdPrefix)),
+  )) {
+    return json;
+  }
+
+  final courseIds = <String, String>{};
+  final teeIds = <String, String>{};
+  for (final course in courseMaps) {
+    final oldId = course['id'];
+    if (oldId is! String || !oldId.startsWith(ncrdbIdPrefix)) continue;
+    final state = '${course['state'] ?? ''}';
+    final key = catalogCourseKey(
+      state: state,
+      facility: '',
+      name: '${course['name'] ?? ''}',
+      city: '${course['city'] ?? ''}',
+    );
+    final newId = 'cat-${state.toLowerCase()}-$key';
+    courseIds[oldId] = newId;
+    course['id'] = newId;
+    final tees = (course['tees'] as List?) ?? [];
+    for (final tee in tees) {
+      if (tee is! Map) continue;
+      final oldTeeId = tee['id'];
+      if (oldTeeId is! String) continue;
+      final newTeeId = _swapIdPrefix(oldTeeId, oldId, newId);
+      teeIds[oldTeeId] = newTeeId;
+      tee['id'] = newTeeId;
+    }
+  }
+  for (final round in roundMaps) {
+    final courseId = round['courseId'];
+    if (courseId is String && courseIds.containsKey(courseId)) {
+      round['courseId'] = courseIds[courseId];
+      final teeId = round['teeId'];
+      if (teeId is String && teeIds.containsKey(teeId)) {
+        round['teeId'] = teeIds[teeId];
+      }
+    }
+  }
+  return {
+    ...json,
+    'customCourses': courseMaps,
+    'rounds': roundMaps,
+  };
+}
+
+/// Default score-vs-par palette (ARGB): eagle-or-better, birdie, par,
+/// bogey, double, triple-or-worse.
+const Map<int, int> defaultScoreColors = {
+  -2: 0xFF1B5E20,
+  -1: 0xFF43A047,
+  0: 0xFF607D8B,
+  1: 0xFFF9A825,
+  2: 0xFFE65100,
+  3: 0xFFD32F2F,
+};
+
+/// Labels for the six editable score buckets, diff first.
+const List<(int, String)> scoreColorLabels = [
+  (-2, 'Eagle or better'),
+  (-1, 'Birdie'),
+  (0, 'Par'),
+  (1, 'Bogey'),
+  (2, 'Double'),
+  (3, 'Triple or worse'),
+];
+
+/// JSON codec for the persisted colors (keys are strings in JSON).
+/// Unknown/missing entries fall back to defaults; never throws.
+Map<String, int> encodeScoreColors(Map<int, int> colors) => {
+  for (final e in colors.entries) '${e.key}': e.value,
+};
+
+Map<int, int> decodeScoreColors(Object? json) {
+  final out = Map<int, int>.of(defaultScoreColors);
+  if (json is Map) {
+    for (final e in json.entries) {
+      final d = int.tryParse('${e.key}');
+      final v = e.value is num
+          ? (e.value as num).toInt()
+          : int.tryParse('${e.value}');
+      if (d != null && d >= -2 && d <= 3 && v != null) out[d] = v;
+    }
+  }
+  return out;
+}
